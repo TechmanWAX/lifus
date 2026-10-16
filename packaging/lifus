@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+"""System-Python launcher (intentionally ignores active virtual environments)."""
+import sys
+sys.path.insert(0, '/usr/share/lifus')
+from lifus.cli import main
+raise SystemExit(main())

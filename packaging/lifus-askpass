@@ -1,0 +1,31 @@
+#!/usr/bin/python3 -I
+"""sudo askpass: the sole password destination is sudo's private stdout pipe."""
+import sys
+import tkinter as tk
+from tkinter import simpledialog
+
+
+def main():
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        password = simpledialog.askstring('Lifus — administrator authorization',
+            'Enter your sudo password to authorize the confirmed disk operation:',
+            show='*', parent=root)
+        if password is None:
+            return 1
+        # Do not log, persist, export or send this to the Lifus parent process.
+        sys.stdout.write(password + '\n')
+        sys.stdout.flush()
+        return 0
+    except Exception:
+        # Never include exception locals or credentials in diagnostics.
+        return 1
+    finally:
+        if root is not None:
+            root.destroy()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

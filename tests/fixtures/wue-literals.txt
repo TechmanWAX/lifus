@@ -1,0 +1,83 @@
+/*
+ * Rufus: The Reliable USB Formatting Utility
+ * Windows User Experience
+ * Copyright © 2022-2026 Pete Batard <pete@akeo.ie>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/* Test-only literal excerpts from src/wue.c at Rufus
+ * 714e3ad90126fa0d751d071222f3b29e11d8f435. Not compiled.
+ * See COPYING.md; unrelated Windows implementation omitted.
+ */
+const char* bypass_name[] = { "BypassTPMCheck", "BypassSecureBootCheck", "BypassRAMCheck" };
+"<unattend xmlns=\"urn:schemas-microsoft-com:unattend\">\n"
+"  <settings pass=\"windowsPE\">\n"
+"    <component name=\"Microsoft-Windows-Setup\" processorArchitecture=\"%s\" language=\"neutral\" "
+"      <UserData>\n"
+"        <AcceptEula>true</AcceptEula>\n"
+"        <ProductKey>\n"
+"          <Key />\n"
+"        </ProductKey>\n"
+"      </UserData>\n"
+"              <Order>1</Order>\n"
+"              <Order>2</Order>\n"
+"              <Order>3</Order>\n"
+"              <Key>/IMAGE/INDEX</Key>\n"
+"              <Value>%d</Value>\n"
+"      <RunSynchronous>\n"
+"        <RunSynchronousCommand wcm:action=\"add\">\n"
+"          <Order>%d</Order>\n"
+"          <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v %s /t REG_DWORD /d 1 /f</Path>\n"
+"        </RunSynchronousCommand>\n"
+"      </RunSynchronous>\n"
+"    </component>\n"
+"    <component name=\"Microsoft-Windows-International-Core-WinPE\" processorArchitecture=\"%s\" language=\"neutral\" "
+"  </settings>\n"
+"  <settings pass=\"specialize\">\n"
+"    <component name=\"Microsoft-Windows-Deployment\" processorArchitecture=\"%s\" language=\"neutral\" "
+"reg add \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f"
+"          <Path>%s</Path>\n"
+"  <settings pass=\"oobeSystem\">\n"
+"    <component name=\"Microsoft-Windows-Shell-Setup\" processorArchitecture=\"%s\" language=\"neutral\" "
+"      <OOBE>\n"
+"        <HideEULAPage>true</HideEULAPage>\n"
+"        <ProtectYourPC>3</ProtectYourPC>\n"
+"      </OOBE>\n"
+"      <UserAccounts>\n"
+"        <LocalAccounts>\n"
+"          <LocalAccount wcm:action=\"add\">\n"
+"            <Name>%s</Name>\n"
+"            <DisplayName>%s</DisplayName>\n"
+"            <Group>Administrators;Power Users</Group>\n"
+"            <Password>\n"
+"              <Value>UABhAHMAcwB3AG8AcgBkAA==</Value>\n"
+"              <PlainText>false</PlainText>\n"
+"            </Password>\n"
+"          </LocalAccount>\n"
+"        </LocalAccounts>\n"
+"      </UserAccounts>\n"
+"net user \"%s\" /logonpasswordchg:yes"
+"      <FirstLogonCommands>\n"
+"        <SynchronousCommand wcm:action=\"add\">\n"
+"          <CommandLine>%s</CommandLine>\n"
+"        </SynchronousCommand>\n"
+"      </FirstLogonCommands>\n"
+"    <component name=\"Microsoft-Windows-International-Core\" processorArchitecture=\"%s\" language=\"neutral\" "
+"    <component name=\"Microsoft-Windows-SecureStartup-FilterDriver\" processorArchitecture=\"%s\" language=\"neutral\" "
+"    <component name=\"Microsoft-Windows-EnhancedStorage-Adm\" processorArchitecture=\"%s\" language=\"neutral\" "
+"  <settings pass=\"offlineServicing\">\n"
+"    <component name=\"Microsoft-Windows-PartitionManager\" processorArchitecture=\"%s\" language=\"neutral\" "
+"    <component name=\"Microsoft-Windows-CodeIntegrity\" processorArchitecture=\"%s\" language=\"neutral\" "
+"</unattend>\n"

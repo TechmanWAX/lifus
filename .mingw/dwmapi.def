@@ -1,4 +1,0 @@
-EXPORTS
-  DwmGetColorizationColor@8
-  DwmGetWindowAttribute@16
-  DwmSetWindowAttribute@16

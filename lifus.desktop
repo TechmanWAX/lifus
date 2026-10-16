@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lifus
+GenericName=USB Image Writer
+Comment=Unofficial native Linux Rufus-inspired utility
+Exec=lifus gui
+Icon=lifus
+Terminal=false
+Categories=System;Utility;
+Keywords=USB;ISO;image;boot;Rufus;
+StartupNotify=true
