@@ -62,6 +62,13 @@ value. Missing/unreadable directories fall back to the home directory; config
 write failures never block image selection. Preferences are not used by the
 privileged worker.
 
+## Automated GitHub builds
+
+GitHub Actions builds and tests pushes to `master`, pull requests and manual runs.
+Version tags `vX.Y.Z` create a draft release with the Debian package, application
+source archive and checksums. See [release workflow](docs/RELEASES.md) for usage
+and required third-party source checks before publication.
+
 ## Build a Debian package (does not install)
 
 ```sh
