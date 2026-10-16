@@ -1,0 +1,20 @@
+name: Publish existing v0.3.0
+on:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/publish-existing.yml']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Publish verified existing release without replacing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view v0.3.0 --json tagName,isDraft,assets
+          gh release edit v0.3.0 --draft=false
+          gh release view v0.3.0 --json tagName,isDraft,url,assets

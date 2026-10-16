@@ -71,7 +71,7 @@ jobs:
           retention-days: 30
 
   release:
-    name: Create draft release
+    name: Publish release
     needs: build
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
@@ -84,7 +84,7 @@ jobs:
         with:
           name: lifus-${{ needs.build.outputs.version }}-${{ github.sha }}
           path: dist
-      - name: Verify and create draft
+      - name: Verify and publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -95,5 +95,5 @@ jobs:
           sha256sum --check SHA256SUMS
           gh release create "$TAG" \
             "lifus_${VERSION}-1_all.deb" "lifus-${VERSION}-source.tar.gz" SHA256SUMS \
-            --verify-tag --draft --title "Lifus $VERSION" \
-            --notes 'Experimental native Linux USB utility. Includes a Debian/Ubuntu package, application source archive and SHA-256 checksums. Before publishing, verify corresponding-source obligations for bundled third-party boot binaries (see COPYING.md). Automated tests do not certify physical USB writes, Windows installation or Secure Boot.'
+            --verify-tag --title "Lifus $VERSION" \
+            --notes 'Experimental native Linux USB utility. Includes a Debian/Ubuntu package, application source archive and SHA-256 checksums. Distributors must verify corresponding-source obligations for bundled third-party boot binaries (see COPYING.md). Automated tests do not certify physical USB writes, Windows installation or Secure Boot.'
