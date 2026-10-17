@@ -6,7 +6,7 @@ does **not** contain this Linux port. The local repository root contains the Lin
 implementation, tests, packaging scripts and documentation. Do not substitute a
 fresh upstream clone for the corresponding source of this package.
 
-Distribute `lifus-0.3.0-source.tar.gz` alongside `lifus_0.3.0-1_all.deb`.
+Distribute `lifus-0.4.0-source.tar.gz` alongside `lifus_0.4.0-1_all.deb`.
 From the local checkout root, produce both with:
 
 ```sh
@@ -30,8 +30,8 @@ substitute for that obligation.
 Rebuild from the supplied source archive (no Git checkout required):
 
 ```sh
-tar -xzf lifus-0.3.0-source.tar.gz
-cd lifus-0.3.0
+tar -xzf lifus-0.4.0-source.tar.gz
+cd lifus-0.4.0
 /usr/bin/python3 build-deb.py
 # Run from the repository root
 /usr/bin/python3 -m unittest discover -s tests -v

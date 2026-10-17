@@ -24,7 +24,11 @@ class OperationsReviewTests(unittest.TestCase):
                                      label='TEST', partition_table='gpt'),
                         missing_tools=[], staging_bytes=32, offset=4096, size=32,
                         efi_offset=8192 if efi else None)
-            def stage(path, *args):
+            if action == 'windows':
+                source = Path(directory, 'source.iso')
+                source.write_bytes(b'fixture')
+                plan.update(source=str(source), source_identity=operations._source_identity(source), archive_type='Iso')
+            def stage(path, *args, **kwargs):
                 Path(path).write_bytes(b'x' * 32)
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(operations.os, 'geteuid', return_value=0))

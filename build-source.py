@@ -30,7 +30,7 @@ def main():
     base = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', type=Path, default=base / 'dist')
-    parser.add_argument('--version', default='0.3.0')
+    parser.add_argument('--version', default='0.4.0')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9][A-Za-z0-9.+~]*', args.version):
         parser.error('Invalid version')

@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import os
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from lifus import cli, gui
+
+QT = gui.QApplication.instance() or gui.QApplication([])
 
 
 class FrontendIntegrationTests(unittest.TestCase):
@@ -20,7 +24,8 @@ class FrontendIntegrationTests(unittest.TestCase):
             app.work('format', '', '/dev/test', '', {}, True, True)
         events = list(app.events.queue)
         self.assertFalse(any(kind == 'error' for kind, _ in events), events)
-        self.assertIn(('progress', (4, 8)), events)
+        self.assertIn(('phase', {'phase': 'write', 'completed': 4, 'total': 8}), events)
+        self.assertFalse(any(kind == 'progress' for kind, _ in events))
 
     def test_all_backend_filesystems_accessible(self):
         for fs in ('fat32','ntfs','exfat','ext2','ext3','ext4'):
@@ -28,20 +33,17 @@ class FrontendIntegrationTests(unittest.TestCase):
             self.assertEqual(args.filesystem, fs)
 
     def make_app(self, action='format'):
-        from unittest.mock import MagicMock
-        app = gui.Application.__new__(gui.Application)
-        for name, value in dict(action=action, source='/source.iso', destination='/out.img',
-                                device='disk', execute=True, filesystem='fat32', scheme='mbr',
-                                label='LIFUS', size='4096', passes='3', staging='/space dir', verify=True).items():
-            setattr(app, name, MagicMock(get=lambda value=value: value))
-        app.devices = {'disk': '/dev/test'}
+        with patch.object(gui, 'list_devices', return_value=[]):
+            app = gui.Application(gui.QWidget())
+        self.addCleanup(app.root.close)
+        app.action.setCurrentIndex(app.action.findData(action))
+        for name, value in dict(source='/source.iso', destination='/out.img',
+                                label='LIFUS', size='4096', staging='/space dir').items():
+            getattr(app, name).setText(value)
+        app.scheme.setCurrentText('mbr')
+        app.passes.setCurrentText('3')
+        app.device_box.addItem('disk', '/dev/test')
         app.device_info = {'/dev/test': {}}
-        app.busy = False
-        app.append_log = MagicMock()
-        app.cancel_event = threading.Event()
-        app.start_button = MagicMock()
-        app.progress = {}
-        app.status = MagicMock()
         return app
 
     def test_mounted_usb_requires_warning_and_exact_confirmation(self):
@@ -49,13 +51,13 @@ class FrontendIntegrationTests(unittest.TestCase):
             with self.subTest(approve=approve, typed=typed):
                 app = self.make_app('write')
                 app.device_info['/dev/test'] = dict(protected=True, transport='usb', removable=True, mountpoints=['/media/usb'])
-                with patch.object(gui, 'load_backend') as load, patch.object(gui.messagebox, 'askyesno', return_value=approve) as warning, patch.object(gui.simpledialog, 'askstring', return_value=typed) as confirm, patch.object(gui.messagebox, 'showerror') as error, patch.object(gui.threading, 'Thread') as thread:
+                with patch.object(gui, 'load_backend') as load, patch.object(gui.QMessageBox, 'question', return_value=gui.QMessageBox.Yes if approve else gui.QMessageBox.No) as warning, patch.object(gui.QInputDialog, 'getText', return_value=(typed or '', typed is not None)) as confirm, patch.object(gui.QMessageBox, 'critical') as error, patch.object(gui.threading, 'Thread') as thread:
                     load.return_value.plan_unmount.return_value = {'identity': {'serial': 'usb'}, 'mountpoints': ['/media/usb'], 'warning': 'Close files'}
                     app.start()
                 error.assert_not_called()
                 warning.assert_called_once()
-                self.assertIn('/media/usb', warning.call_args.args[1])
-                self.assertIn('ALL DATA', warning.call_args.args[1])
+                self.assertIn('/media/usb', warning.call_args.args[2])
+                self.assertIn('ALL DATA', warning.call_args.args[2])
                 self.assertEqual(confirm.call_count, int(approve))
                 load.return_value.plan_unmount.assert_called_once_with('/dev/test', protected_paths=('/source.iso', '/space dir', tempfile.gettempdir()))
                 load.return_value.unmount_target.assert_not_called()
@@ -96,7 +98,7 @@ class FrontendIntegrationTests(unittest.TestCase):
                 current = {'identity': original, 'mountpoints': ['/media/usb'], 'warning': 'Close files'}
                 def typed(*args):
                     current['identity'] = {'serial': 'B'}
-                    return '/dev/test'
+                    return '/dev/test', True
                 def elevated(argv, **kwargs):
                     import contextlib
                     import io
@@ -104,7 +106,7 @@ class FrontendIntegrationTests(unittest.TestCase):
                     with patch.object(privileges.os, 'geteuid', return_value=0), contextlib.redirect_stdout(io.StringIO()) as output:
                         self.assertEqual(privileges.worker_main(argv), 1)
                     raise ValueError(output.getvalue())
-                with self.subTest(uid=uid, action=action), patch.object(gui.os, 'geteuid', return_value=uid), patch.object(gui, 'load_backend') as preview, patch.object(cli, 'load_backend') as backend, patch.object(gui.messagebox, 'askyesno', return_value=True), patch.object(gui.simpledialog, 'askstring', side_effect=typed), patch.object(gui.messagebox, 'showerror') as error, patch.object(gui.threading, 'Thread') as thread, patch.object(privileges, 'run_privileged', side_effect=elevated):
+                with self.subTest(uid=uid, action=action), patch.object(gui.os, 'geteuid', return_value=uid), patch.object(gui, 'load_backend') as preview, patch.object(cli, 'load_backend') as backend, patch.object(gui.QMessageBox, 'question', return_value=gui.QMessageBox.Yes), patch.object(gui.QInputDialog, 'getText', side_effect=typed), patch.object(gui.QMessageBox, 'critical') as error, patch.object(gui.threading, 'Thread') as thread, patch.object(privileges, 'run_privileged', side_effect=elevated):
                     preview.return_value.plan_unmount.return_value = current
                     backend.return_value.plan_unmount.return_value = current
                     app.start()
@@ -120,7 +122,7 @@ class FrontendIntegrationTests(unittest.TestCase):
     def test_preflight_refusal_never_prompts_or_starts_worker(self):
         app = self.make_app('write')
         app.device_info['/dev/test'] = dict(protected=True, transport='usb', mountpoints=['/media/usb'])
-        with patch.object(gui, 'load_backend') as load, patch.object(gui.messagebox, 'askyesno') as warning, patch.object(gui.simpledialog, 'askstring') as confirm, patch.object(gui.messagebox, 'showerror') as error, patch.object(gui.threading, 'Thread') as thread:
+        with patch.object(gui, 'load_backend') as load, patch.object(gui.QMessageBox, 'question') as warning, patch.object(gui.QInputDialog, 'getText') as confirm, patch.object(gui.QMessageBox, 'critical') as error, patch.object(gui.threading, 'Thread') as thread:
             load.return_value.plan_unmount.side_effect = ValueError('source is on target')
             app.start()
         error.assert_called_once()
@@ -132,13 +134,13 @@ class FrontendIntegrationTests(unittest.TestCase):
     def test_nonroot_advanced_starts_only_after_confirmation(self):
         app = self.make_app()
         with patch.object(gui.os, 'access', return_value=True), patch.object(gui.os, 'geteuid', return_value=1000), \
-             patch.object(gui.simpledialog, 'askstring', return_value='/dev/test'), \
-             patch.object(gui.messagebox, 'showerror') as error, patch.object(gui.threading, 'Thread') as thread:
+             patch.object(gui.QInputDialog, 'getText', return_value=('/dev/test', True)), \
+             patch.object(gui.QMessageBox, 'critical') as error, patch.object(gui.threading, 'Thread') as thread:
             app.start()
         thread.assert_called_once()
         error.assert_not_called()
         app.busy = False
-        with patch.object(gui.simpledialog, 'askstring', return_value=None), patch.object(gui.threading, 'Thread') as thread:
+        with patch.object(gui.QInputDialog, 'getText', return_value=('', False)), patch.object(gui.threading, 'Thread') as thread:
             app.start()
         thread.assert_not_called()
 
@@ -177,23 +179,18 @@ class FrontendIntegrationTests(unittest.TestCase):
 
     def test_protected_visible_for_backup_but_write_blocked(self):
         app = self.make_app('backup')
-        from unittest.mock import MagicMock
-        app.device_box = {}
-        app.device = MagicMock()
-        app.device.get.return_value = ''
         with patch.object(gui, 'list_devices', return_value=[dict(path='/dev/test', protected=True, mountpoints=['/'])]):
             app.refresh()
         self.assertEqual(list(app.devices.values()), ['/dev/test'])
         name = next(iter(app.devices))
-        self.assertIn('WRITE UNAVAILABLE', name)
-        app.device.get.return_value = name
+        self.assertIn('запись запрещена', name)
+        app.device_box.setCurrentText(name)
         with patch.object(gui.threading, 'Thread') as thread:
             app.start()
             thread.assert_called_once()
         app.busy = False
-        app.action = MagicMock()
-        app.action.get.return_value = 'write'
-        with patch.object(gui.messagebox, 'showerror') as error, patch.object(gui.threading, 'Thread') as thread:
+        app.action.setCurrentIndex(app.action.findData('write'))
+        with patch.object(gui.QMessageBox, 'critical') as error, patch.object(gui.threading, 'Thread') as thread:
             app.start()
             thread.assert_not_called()
             error.assert_called_once()
@@ -264,24 +261,24 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(archives[0].read_bytes()).digest(), hashlib.sha256(archives[1].read_bytes()).digest())
             with tarfile.open(archives[0]) as archive:
                 names = archive.getnames()
-                self.assertIn('lifus-0.3.0/lifus/cli.py', names)
-                self.assertIn('lifus-0.3.0/upstream/res/freedos/KERNEL.SYS', names)
-                self.assertIn('lifus-0.3.0/COPYING.md', names)
-                self.assertFalse(any(n.startswith(('lifus-0.3.0/src/', 'lifus-0.3.0/res/',
-                                                  'lifus-0.3.0/.mingw/', 'lifus-0.3.0/.vs/',
-                                                  'lifus-0.3.0/.github/')) for n in names))
-                self.assertNotIn('lifus-0.3.0/configure', names)
+                self.assertIn('lifus-0.4.0/lifus/cli.py', names)
+                self.assertIn('lifus-0.4.0/upstream/res/freedos/KERNEL.SYS', names)
+                self.assertIn('lifus-0.4.0/COPYING.md', names)
+                self.assertFalse(any(n.startswith(('lifus-0.4.0/src/', 'lifus-0.4.0/res/',
+                                                  'lifus-0.4.0/.mingw/', 'lifus-0.4.0/.vs/',
+                                                  'lifus-0.4.0/.github/')) for n in names))
+                self.assertNotIn('lifus-0.4.0/configure', names)
                 self.assertFalse(any('/.git/' in n or '/dist/' in n or '/__pycache__/' in n for n in names))
-                self.assertFalse(any(n.startswith('lifus-0.3.0/linux/') for n in names))
-                self.assertIn('lifus-0.3.0/build-deb.py', names)
-                self.assertIn('lifus-0.3.0/SOURCE_DATE_EPOCH', names)
+                self.assertFalse(any(n.startswith('lifus-0.4.0/linux/') for n in names))
+                self.assertIn('lifus-0.4.0/build-deb.py', names)
+                self.assertIn('lifus-0.4.0/SOURCE_DATE_EPOCH', names)
                 archive.extractall(root / 'source', filter='data')
-            source_root = root / 'source/lifus-0.3.0'
+            source_root = root / 'source/lifus-0.4.0'
             clean_env = dict(os.environ)
             clean_env.pop('SOURCE_DATE_EPOCH', None)
             subprocess.run([sys.executable, str(source_root / 'build-deb.py')],
                            cwd=source_root, env=clean_env, check=True, capture_output=True)
-            rebuilt = source_root / 'dist/lifus_0.3.0-1_all.deb'
+            rebuilt = source_root / 'dist/lifus_0.4.0-1_all.deb'
             self.assertEqual(hashlib.sha256(rebuilt.read_bytes()).hexdigest(), hashes[0])
 
 

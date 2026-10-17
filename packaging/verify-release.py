@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -33,7 +34,7 @@ def main():
             if path.read_bytes() != (module_root / 'lifus' / path.name).read_bytes():
                 raise RuntimeError('Packaged module mismatch: ' + path.name)
         env = dict(os.environ, PYTHONPATH=str(module_root))
-        run('/usr/bin/python3', '-m', 'unittest', 'discover', '-s', str(root / 'tests'), '-v',
+        run(sys.executable, '-m', 'unittest', 'discover', '-s', str(root / 'tests'), '-v',
             cwd=tmp, env=env)
         unpacked = tmp / 'source'
         with tarfile.open(source) as archive:

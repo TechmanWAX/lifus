@@ -1,8 +1,10 @@
 """Advanced media operations using argv-only subprocesses and no kernel mounts.
 
 A preview is not authorization: execute regenerates it and revalidates identity.
-All filesystem construction happens in private regular files before disk writes.
+Windows FAT32 streams directly into the bounded target partition; other filesystem
+paths retain private-file staging. No operation acquires mounts or loop devices.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -29,9 +31,28 @@ def _check_cancel(cancel):
         raise OperationCancelled('Cancelled; target may contain incomplete data')
 
 
-def _run(args, *, input=None):
-    completed = subprocess.run(args, input=input, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, check=False)
+def _run(args, *, input=None, cancel=None):
+    if cancel is None:
+        completed = subprocess.run(args, input=input, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, check=False)
+    else:
+        _check_cancel(cancel)
+        with subprocess.Popen(args, stdin=subprocess.PIPE if input is not None else None,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+            try:
+                while True:
+                    _check_cancel(cancel)
+                    try:
+                        stdout, stderr = proc.communicate(input=input, timeout=0.2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        input = None
+                completed = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.communicate()
+        _check_cancel(cancel)
     if completed.returncode:
         raise RuntimeError(f'{args[0]} failed: {completed.stderr.decode(errors="replace")[-4000:]}')
     return completed.stdout
@@ -55,9 +76,19 @@ def _safe_member(name):
     return str(PurePosixPath(name))
 
 
-def _members(source):
-    # Listing only. Never let an archive extractor choose filesystem destinations.
-    text = _run(['7z', 'l', '-slt', '--', source]).decode('utf-8', 'strict')
+def _members(source, *, archive_type=None, with_type=False, maximum=64*MiB, cancel=None):
+    # Pin the detected archive parser too: extensionless /proc descriptors may
+    # select the ISO9660 boot-only view instead of a Windows ISO's UDF tree.
+    from .direct_fat import stream_command
+    args = ['7z', 'l', '-slt'] + (['-t' + archive_type] if archive_type else [])
+    output = bytearray()
+    chunks = stream_command(args + ['--', source], lambda: _check_cancel(cancel))
+    with contextlib.closing(chunks):
+        for chunk in chunks:
+            if len(output) + len(chunk) > maximum:
+                raise ValueError('ISO metadata listing exceeds bounded memory limit')
+            output.extend(chunk)
+    text = output.decode('utf-8', 'strict')
     if '----------\n' not in text:
         raise ValueError('Unrecognized archive listing')
     records = []
@@ -77,17 +108,22 @@ def _members(source):
         records.append(dict(path=name, size=int(fields.get('Size') or 0), directory=directory))
     if not records:
         raise ValueError('Empty or unsupported ISO')
+    if with_type:
+        match = re.search(r'(?m)^Type = (\w+)$', text.split('----------\n', 1)[0])
+        if not match:
+            raise ValueError('Archive parser type is missing')
+        return records, match.group(1)
     return records
 
 
-def _read_member(source, member, maximum=MiB):
-    data = _run(['7z', 'x', '-so', '-spd', '--', source, member])
+def _read_member(source, member, maximum=MiB, cancel=None):
+    data = _run(['7z', 'x', '-so', '-spd', '--', source, member], cancel=cancel)
     if len(data) > maximum:
         raise ValueError('Metadata member too large')
     return data
 
 
-def _source_safe(source, target):
+def _source_safe(source, target, cancel=None):
     if not source:
         return
     source_stat = os.stat(source)
@@ -95,7 +131,7 @@ def _source_safe(source, target):
     if os.path.samefile(source, target):
         raise ValueError('Source is the target')
     if stat.S_ISBLK(target_stat.st_mode):
-        tree = json.loads(_run(['lsblk', '--json', '-o', 'PATH,MAJ:MIN', target]))
+        tree = json.loads(_run(['lsblk', '--json', '-o', 'PATH,MAJ:MIN', target], cancel=cancel))
         def walk(nodes):
             for node in nodes:
                 yield node['maj:min']
@@ -105,26 +141,61 @@ def _source_safe(source, target):
             raise ValueError('Source or staging directory is on target disk')
 
 
+def _stat_identity(s):
+    if not stat.S_ISREG(s.st_mode):
+        raise ValueError('Source must be a regular file')
+    return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+
+
+@contextlib.contextmanager
+def _open_approved(path, identity):
+    # NONBLOCK is essential: a regular file can be swapped for a FIFO before open.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if _stat_identity(os.fstat(fd)) != identity:
+            raise ValueError('Source changed while opening')
+        yield fd
+        if _stat_identity(os.fstat(fd)) != identity:
+            raise ValueError('Source changed while reading')
+    finally:
+        os.close(fd)
+
+
+def _read_approved(path, identity):
+    if identity[2] > MiB:
+        raise ValueError('Invalid unattend XML: larger than 1 MiB')
+    with _open_approved(path, identity) as fd:
+        data = bytearray()
+        while len(data) <= identity[2]:
+            chunk = os.read(fd, identity[2] + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) != identity[2]:
+            raise ValueError('Source changed while reading')
+    return bytes(data)
+
+
 def _source_identity(path):
     s = os.stat(path)
     if not stat.S_ISREG(s.st_mode):
         raise ValueError('Source must be a regular ISO file')
-    return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns]
+    return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
 
 
-def _persistence_layout(source, target, size, records, requested):
+def _persistence_layout(source, target, size, records, requested, cancel=None):
     paths = {r['path'].lower(): r for r in records}
     if 'live/filesystem.squashfs' not in paths or '.disk/info' not in paths:
         raise ValueError('Persistence requires a recognized Debian Live image')
-    info = _read_member(source, paths['.disk/info']['path']).decode(errors='replace')
+    info = _read_member(source, paths['.disk/info']['path'], cancel=cancel).decode(errors='replace')
     if 'Debian' not in info:
         raise ValueError('Only Debian Live persistence is supported')
     configs = [r for r in records if r['path'].lower().endswith(('.cfg', '.conf')) and r['size'] < MiB]
     enabled = any(re.search(rb'(?m)^\s*(?:linux|linuxefi|append)\s+[^\n]*\bpersistence\b',
-                            _read_member(source, r['path'])) for r in configs)
+                            _read_member(source, r['path'], cancel=cancel)) for r in configs)
     if not enabled:
         raise ValueError('ISO must already have a boot entry with the persistence kernel parameter')
-    table = json.loads(_run(['sfdisk', '--json', target]))['partitiontable']
+    table = json.loads(_run(['sfdisk', '--json', target], cancel=cancel))['partitiontable']
     parts = table.get('partitions', [])
     if table['label'] != 'dos' or table.get('sectorsize', 512) != 512 or not 1 <= len(parts) < 4:
         raise ValueError('Persistence requires an existing MBR hybrid ISO with a free primary slot')
@@ -138,7 +209,7 @@ def _persistence_layout(source, target, size, records, requested):
     return start, length
 
 
-def plan_operation(action, source, target, **options) -> dict:
+def plan_operation(action, source, target, *, cancel=None, **options) -> dict:
     if 'partition_scheme' in options:
         options['partition_table'] = options.pop('partition_scheme')
     if 'persistence_mib' in options:
@@ -158,11 +229,11 @@ def plan_operation(action, source, target, **options) -> dict:
         if os.path.islink(xml_path):
             raise ValueError('Unattend symlinks are not supported')
         unattend_identity = _source_identity(xml_path)
-        _source_safe(xml_path, target)
+        _source_safe(xml_path, target, cancel)
         if unattend_identity[2] > MiB:
             raise ValueError('Invalid unattend XML: larger than 1 MiB')
         try:
-            data = Path(xml_path).read_bytes()
+            data = _read_approved(xml_path, unattend_identity)
             if b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
                 raise ValueError('Invalid unattend XML: DTD/entities forbidden')
             if ET.fromstring(data).tag != '{urn:schemas-microsoft-com:unattend}unattend':
@@ -171,7 +242,7 @@ def plan_operation(action, source, target, **options) -> dict:
             raise ValueError('Invalid unattend XML') from exc
         options['unattend'] = xml_path
     source = os.path.realpath(source) if source else None
-    _source_safe(source, target)
+    _source_safe(source, target, cancel)
     filesystem = options.get('filesystem', 'fat32')
     table = options.get('partition_table', 'gpt')
     if filesystem not in ('fat32', 'ntfs', 'exfat', 'ext2', 'ext3', 'ext4'):
@@ -199,12 +270,13 @@ def plan_operation(action, source, target, **options) -> dict:
     warning = 'ALL target data will be destroyed.'
     tools = ['parted', 'mkfs.' + ('vfat' if filesystem == 'fat32' else filesystem)]
     records = []
+    archive_type = None
     source_id = None
     if action in ('windows', 'persistence'):
         if not source:
             raise ValueError('This operation requires a source ISO')
         source_id = _source_identity(source)
-        records = _members(source)
+        records, archive_type = _members(source, with_type=True, cancel=cancel)
         tools += ['7z']
     if action == 'windows':
         if filesystem not in ('fat32', 'ntfs'):
@@ -219,10 +291,7 @@ def plan_operation(action, source, target, **options) -> dict:
         for r in records:
             if filesystem == 'fat32' and r['size'] > FAT_LIMIT and r['path'].lower() != 'sources/install.wim':
                 raise ValueError('Oversize FAT32 file cannot be split: ' + r['path'])
-        tools += ['wimlib-imagex'] + (['mcopy'] if filesystem == 'fat32' else [])
-        steps[1:1] = ['Extract individual ISO files through stdout into private staging (no mounts)',
-                      'Split install.wim over FAT32 limit into 3800 MiB .swm parts',
-                      'Populate FAT32 image using mtools; preserve supplied UEFI loaders']
+        tools += ['wimlib-imagex']
         if filesystem == 'ntfs':
             _uefi_ntfs_asset()
             steps = ['Revalidate target and stage ISO files without mounts',
@@ -230,7 +299,7 @@ def plan_operation(action, source, target, **options) -> dict:
                      'Create data partition and upstream UEFI:NTFS EFI partition',
                      'Write and verify both filesystems; original disk data is erased']
     elif action == 'persistence':
-        start, length = _persistence_layout(source, target, info['size'], records, options.get('persistence_size'))
+        start, length = _persistence_layout(source, target, info['size'], records, options.get('persistence_size'), cancel=cancel)
         filesystem, label = 'ext4', 'persistence'
         tools = ['7z', 'sfdisk', 'mkfs.ext4']
         warning = 'Append a Debian persistence partition in unused space; existing media can be damaged if interrupted.'
@@ -244,14 +313,38 @@ def plan_operation(action, source, target, **options) -> dict:
         steps = [f'Write address-dependent pseudorandom data to EVERY byte ({passes} passes)',
                  'fsync, evict cache where supported, then read and compare EVERY byte',
                  'Stop at first mismatch; original contents are NOT restored']
+    staging_bytes = length
+    if action == 'windows':
+        payload = sum(r['size'] for r in records)
+        staging_bytes = length + 2 * payload
+        if filesystem == 'fat32':
+            warning += ' Quick format, not secure erasure: free clusters retain old bytes.'
+            from .direct_fat import Layout
+            large = [r for r in records if not r['directory'] and r['size'] > FAT_LIMIT]
+            if large and any(re.fullmatch(r'sources/install\d*\.swm', r['path'].casefold()) for r in records):
+                raise ValueError('Split WIM output collides with ISO files')
+            preview_records = [dict(r, size=0) if r in large else r for r in records]
+            Layout(preview_records, length, start, label)  # namespace/geometry before destruction
+            staging_bytes = sum(2 * r['size'] + 64 * MiB for r in large)
+            tools = ['parted', '7z'] + (['wimlib-imagex'] if large else [])
+            warning += ' Cancellation/read errors can leave incomplete installation media.'
+            steps = ['Validate ISO namespace, source identity, capacity and pinned target',
+                     'Pre-split oversized install.wim only (exceptional temporary staging)' if large
+                     else 'No temporary payloads or partition image: staging 0 bytes',
+                     f'Create {table} and FAT32 directly on the target (UEFI only)',
+                     'Stream ISO files with bounded buffers; hash input bytes',
+                     'fsync, verify FAT metadata and read back every file hash']
+    if action == 'badblocks':
+        staging_bytes = 0
     normalized = dict(options, filesystem=filesystem, partition_table=table, label=label, passes=passes)
     return dict(action=action, source=source, source_identity=source_id, target=target, identity=info,
                 unattend_identity=unattend_identity, efi_offset=efi_offset,
+                archive_type=archive_type,
+                member_fingerprint=hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest(),
                 options=normalized, destructive=True, warning=warning, steps=steps,
                 offset=start, size=length, required_tools=tools,
                 missing_tools=[t for t in tools if not shutil.which(t)],
-                staging_bytes=(length + sum(r['size'] for r in records)*2 if action == 'windows' else length)
-                if action != 'badblocks' else 0)
+                staging_bytes=staging_bytes)
 
 
 def _uefi_ntfs_asset():
@@ -262,7 +355,7 @@ def _uefi_ntfs_asset():
     return path
 
 
-def _format_image(path, size, filesystem, label, contents=None):
+def _format_image(path, size, filesystem, label, contents=None, cancel=None):
     with open(path, 'xb') as stream:
         stream.truncate(size)
     if filesystem == 'fat32':
@@ -276,10 +369,10 @@ def _format_image(path, size, filesystem, label, contents=None):
         if contents:
             args += ['-d', contents]
         args += [path]
-    _run(args)
+    _run(args, cancel=cancel)
 
 
-def _extract(source, records, destination, cancel):
+def _extract(source, records, destination, cancel, archive_type=None):
     for record in records:
         _check_cancel(cancel)
         name = _safe_member(record['path'])
@@ -290,27 +383,195 @@ def _extract(source, records, destination, cancel):
         output.parent.mkdir(parents=True, exist_ok=True)
         # 7z receives no filesystem output directory. Links become ordinary bytes,
         # and exclusive creates prevent duplicate paths from replacing anything.
-        with open(output, 'xb') as stream, tempfile.TemporaryFile() as errors:
-            proc = subprocess.Popen(['7z', 'x', '-so', '-spd', '--', source, name],
-                                    stdout=subprocess.PIPE, stderr=errors)
+        from .direct_fat import stream_command
+        chunks = stream_command(['7z', 'x', '-so', '-spd'] + (['-t' + archive_type] if archive_type else []) + ['--', source, name],
+                                lambda: _check_cancel(cancel))
+        with open(output, 'xb') as stream, contextlib.closing(chunks):
             copied = 0
-            try:
-                while True:
-                    _check_cancel(cancel)
-                    chunk = proc.stdout.read(MiB)
-                    if not chunk:
-                        break
-                    copied += len(chunk)
+            for chunk in chunks:
+                copied += len(chunk)
+                if copied > record['size']:
+                    raise ValueError('Archive output exceeds declared size')
+                stream.write(chunk)
+            if copied != record['size']:
+                raise ValueError('ISO extraction failed or size changed')
+
+
+def _populate_fat32(source, records, destination, image, options, progress, cancel):
+    """Keep at most one extracted input (or the original WIM + its splits)."""
+    directories = set()
+    def mkdir(name):
+        if name in ('', '.') or name in directories:
+            return
+        mkdir(str(PurePosixPath(name).parent))
+        _check_cancel(cancel)
+        _run(['mmd', '-i', image, '::/' + name], cancel=cancel)
+        directories.add(name)
+
+    def copy(path, name):
+        mkdir(str(PurePosixPath(name).parent))
+        _check_cancel(cancel)
+        _run(['mcopy', '-i', image, str(path), '::/' + name], cancel=cancel)
+        path.unlink()
+        if progress:
+            progress(dict(phase='prepare', completed=0, total=0))
+
+    # Validate the entire tree before releasing individual inputs; otherwise a
+    # file 'a' followed by 'a/b' could evade the old exclusive-create protection.
+    files = {r['path'].casefold() for r in records if not r['directory']}
+    for record in records:
+        name = _safe_member(record['path'])
+        if any(str(p).casefold() in files for p in PurePosixPath(name).parents):
+            raise ValueError('Archive file/directory conflict')
+    ordered = sorted(records, key=lambda r: r['size'] <= FAT_LIMIT)
+    for record in ordered:
+        _check_cancel(cancel)
+        name = record['path']
+        if options.get('unattend') and name.casefold() == 'autounattend.xml':
+            if record['directory']:
+                raise ValueError('ISO autounattend.xml is not a regular file')
+            continue
+        if record['directory']:
+            mkdir(name)
+            continue
+        _extract(source, [record], destination, cancel)
+        path = Path(destination, name)
+        if record['size'] > FAT_LIMIT:
+            if name.casefold() != 'sources/install.wim':
+                raise ValueError('Oversize FAT32 file cannot be split')
+            if any(re.fullmatch(r'sources/install\d*\.swm', f) for f in files):
+                raise ValueError('Split WIM output collides with ISO files')
+            _run(['wimlib-imagex', 'split', str(path), str(path.with_suffix('.swm')), '3800'], cancel=cancel)
+            _check_cancel(cancel)
+            path.unlink()
+            for part in sorted(path.parent.glob(path.stem + '*.swm')):
+                if part.stat().st_size > FAT_LIMIT:
+                    raise ValueError('Split WIM part exceeds FAT32 file limit')
+                copy(part, str(PurePosixPath(name).parent / part.name))
+        else:
+            copy(path, name)
+    if options.get('unattend'):
+        path = Path(destination, 'autounattend.xml')
+        path.write_bytes(_read_approved(options['unattend'], _source_identity(options['unattend'])))
+        copy(path, 'autounattend.xml')
+
+
+def _fat32_ranges(path, cancel=None):
+    """Yield metadata and live cluster ranges; never infer liveness from holes.
+
+    Free clusters deliberately retain old target bytes (quick format, not erase).
+    Even zero-filled live files must be copied over a dirty target. Validate the
+    private mkfs-generated geometry before any target writes; memory stays bounded.
+    """
+    with open(path, 'rb') as stream:
+        boot = stream.read(512)
+        def number(offset, count):
+            return int.from_bytes(boot[offset:offset + count], 'little')
+        sector, cluster = number(11, 2), number(13, 1)
+        reserved, fats, fat_sectors = number(14, 2), number(16, 1), number(36, 4)
+        sectors = number(32, 4)
+        data_sector = reserved + fats * fat_sectors
+        size = os.fstat(stream.fileno()).st_size
+        if (len(boot) != 512 or boot[510:512] != b'\x55\xaa'
+                or sector not in (512, 1024, 2048, 4096)
+                or cluster not in (1, 2, 4, 8, 16, 32, 64, 128)
+                or fats != 2 or reserved < 1 or fat_sectors < 1
+                or number(17, 2) or number(22, 2) or number(40, 2)
+                or not data_sector < sectors or sectors * sector > size):
+            raise ValueError('Invalid staged FAT32 geometry')
+        clusters = (sectors - data_sector) // cluster
+        if clusters < 65525 or clusters + 2 > fat_sectors * sector // 4:
+            raise ValueError('Invalid staged FAT32 cluster count')
+        yield 0, data_sector * sector
+        stream.seek(reserved * sector + 8)
+        run_start = None
+        for first in range(0, clusters, 16384):
+            _check_cancel(cancel)
+            count = min(16384, clusters - first)
+            entries = stream.read(count * 4)
+            if len(entries) != count * 4:
+                raise ValueError('Truncated staged FAT')
+            for index in range(count):
+                allocated = int.from_bytes(entries[index*4:index*4+4], 'little') & 0x0fffffff
+                n = first + index
+                if allocated and run_start is None:
+                    run_start = n
+                elif not allocated and run_start is not None:
+                    yield (data_sector + run_start * cluster) * sector, (n - run_start) * cluster * sector
+                    run_start = None
+        if run_start is not None:
+            yield (data_sector + run_start * cluster) * sector, (clusters - run_start) * cluster * sector
+
+
+def _prepare_direct(source, records, destination, current, cancel):
+    """Only an oversized WIM is staged, split and validated before destruction."""
+    from .direct_fat import Layout, stream_command
+    options = current['options']
+    result = []
+    for record in records:
+        _check_cancel(cancel)
+        name = record['path']
+        if options.get('unattend') and name.casefold() == 'autounattend.xml':
+            if record['directory']:
+                raise ValueError('ISO autounattend.xml is not a regular file')
+            continue
+        if not record['directory'] and record['size'] > FAT_LIMIT:
+            path = Path(destination, 'install.wim')
+            copied = 0
+            chunks = stream_command(['7z', 'x', '-so', '-spd', '-t' + current['archive_type'], '--', source, name],
+                                    lambda: _check_cancel(cancel))
+            with path.open('xb') as stream, contextlib.closing(chunks):
+                for data in chunks:
+                    copied += len(data)
                     if copied > record['size']:
-                        raise ValueError('Archive output exceeds declared size')
-                    stream.write(chunk)
-                if proc.wait() or copied != record['size']:
-                    raise ValueError('ISO extraction failed or size changed')
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-                proc.wait()
-                proc.stdout.close()
+                        raise ValueError('ISO output exceeds declared size')
+                    stream.write(data)
+            if copied != record['size']:
+                raise ValueError('ISO stream size changed')
+            _run(['wimlib-imagex', 'split', str(path), str(path.with_suffix('.swm')), '3800'], cancel=cancel)
+            path.unlink()
+            parts = sorted(Path(destination).glob('install*.swm'))
+            if not parts:
+                raise ValueError('WIM splitter produced no parts')
+            for part in parts:
+                identity = _source_identity(part)
+                size = identity[2]
+                if size > FAT_LIMIT:
+                    raise ValueError('Split WIM part exceeds FAT32 file limit')
+                result.append(dict(path=str(PurePosixPath(name).parent / part.name),
+                                   size=size, directory=False, local=str(part), local_identity=identity))
+        else:
+            result.append(dict(record, archive_type=current['archive_type']))
+    if options.get('unattend'):
+        result.append(dict(path='autounattend.xml', size=current['unattend_identity'][2],
+                           directory=False, data=_read_approved(options['unattend'], current['unattend_identity'])))
+    return Layout(result, current['size'], current['offset'], options['label'])
+
+
+def _direct_stream(source, node, cancel):
+    from .direct_fat import stream_command
+    if 'data' in node:
+        _check_cancel(cancel)
+        yield node['data']
+    elif node.get('local'):
+        fd = node['local_fd']
+        if _stat_identity(os.fstat(fd)) != node['local_identity']:
+            raise ValueError('Source changed before streaming')
+        offset = 0
+        while True:
+            _check_cancel(cancel)
+            chunk = os.pread(fd, MiB, offset)
+            if not chunk:
+                break
+            offset += len(chunk)
+            yield chunk
+        if _stat_identity(os.fstat(fd)) != node['local_identity']:
+            raise ValueError('Source changed during streaming')
+    else:
+        chunks = stream_command(['7z', 'x', '-so', '-spd', '-t' + node['archive_type'], '--', source, node['path']],
+                                lambda: _check_cancel(cancel))
+        with contextlib.closing(chunks):
+            yield from chunks
 
 
 def _same_identity(before, after):
@@ -342,6 +603,8 @@ def _badblocks(fd, size, passes, progress, cancel):
     for passno in range(passes):
         seed = os.urandom(32)
         for phase in ('write', 'verify'):
+            if progress:
+                progress(dict(phase=phase, completed=0, total=size, pass_number=passno+1))
             for offset in range(0, size, block):
                 _check_cancel(cancel)
                 count = min(block, size-offset)
@@ -352,6 +615,8 @@ def _badblocks(fd, size, passes, progress, cancel):
                     raise IOError(f'Bad-block/capacity mismatch at byte offset {offset}')
                 if progress:
                     progress(dict(phase=phase, completed=offset+count, total=size, pass_number=passno+1))
+            if progress:
+                progress(dict(phase='sync', completed=size, total=size, pass_number=passno+1))
             _sync_for_readback(fd)
 
 
@@ -374,7 +639,9 @@ def execute_operation(plan, *, progress=None, cancel=None, expected_identity=Non
     if os.geteuid() != 0:
         raise PermissionError('Advanced execution requires explicit root invocation; preview is unprivileged')
     _check_cancel(cancel)
-    current = plan_operation(plan['action'], plan.get('source'), plan['target'], **plan['options'])
+    if progress:
+        progress(dict(phase='prepare', completed=0, total=plan['size']))
+    current = plan_operation(plan['action'], plan.get('source'), plan['target'], cancel=cancel, **plan['options'])
     if expected_identity is not None:
         unmount.assert_target_identity(plan['target'], expected_identity)
     if not _same_identity(plan['identity'], current['identity']):
@@ -391,19 +658,33 @@ def execute_operation(plan, *, progress=None, cancel=None, expected_identity=Non
     if action == 'persistence':
         _verify_prefix(source, target, cancel)
     stage_parent = options.get('staging_dir') or tempfile.gettempdir()
-    _source_safe(stage_parent, target)
-    if action != 'badblocks' and shutil.disk_usage(stage_parent).free < current['staging_bytes']:
-        raise ValueError('Insufficient staging space; select staging_dir on another filesystem')
-    with tempfile.TemporaryDirectory(prefix='lifus-', dir=stage_parent) as work:
+    _source_safe(stage_parent, target, cancel)
+    free = shutil.disk_usage(stage_parent).free
+    if action != 'badblocks' and free < current['staging_bytes']:
+        raise ValueError(f"Insufficient staging space at {stage_parent}: required "
+                         f"{current['staging_bytes']} bytes, free {free} bytes")
+    direct_fat = action == 'windows' and options['filesystem'] == 'fat32'
+    bytes_written = current['size']
+    with tempfile.TemporaryDirectory(prefix='lifus-', dir=stage_parent) as work, contextlib.ExitStack() as stack:
         filesystem = os.path.join(work, 'partition.img')
         contents = os.path.join(work, 'contents')
         os.mkdir(contents)
         if action == 'windows':
-            _extract(source, _members(source), contents, cancel)
-            for file in Path(contents).rglob('*'):
-                if options['filesystem'] == 'fat32' and file.is_file() and file.stat().st_size > FAT_LIMIT:
-                    _run(['wimlib-imagex', 'split', str(file), str(file.with_suffix('.swm')), '3800'])
-                    file.unlink()
+            source_fd = stack.enter_context(_open_approved(source, current['source_identity']))
+            source_handle = f'/proc/{os.getpid()}/fd/{source_fd}'
+        if direct_fat:
+            if _source_identity(source_handle) != current['source_identity']:
+                raise ValueError('Source changed while opening')
+            pinned_records = _members(source_handle, archive_type=current['archive_type'], cancel=cancel)
+            if hashlib.sha256(json.dumps(pinned_records, sort_keys=True).encode()).hexdigest() != current['member_fingerprint']:
+                raise ValueError('Pinned ISO namespace differs from preflight')
+            layout = _prepare_direct(source_handle, pinned_records, contents, current, cancel)
+            for node in layout.ordered:
+                if node.get('local'):
+                    node['local_fd'] = stack.enter_context(_open_approved(node['local'], node['local_identity']))
+        elif action == 'windows':
+            _extract(source_handle, _members(source_handle, archive_type=current['archive_type'], cancel=cancel),
+                     contents, cancel, archive_type=current['archive_type'])
             if options.get('unattend'):
                 # Explicit option replaces a pre-existing answer file, never silently.
                 for entry in Path(contents).iterdir():
@@ -411,28 +692,27 @@ def execute_operation(plan, *, progress=None, cancel=None, expected_identity=Non
                         if not entry.is_file():
                             raise ValueError('ISO autounattend.xml is not a regular file')
                         entry.unlink()
-                shutil.copyfile(options['unattend'], Path(contents, 'autounattend.xml'))
+                Path(contents, 'autounattend.xml').write_bytes(_read_approved(options['unattend'], current['unattend_identity']))
         elif action == 'persistence':
             Path(contents, 'persistence.conf').write_text('/ union\n')
-        if action != 'badblocks':
+        if action != 'badblocks' and not direct_fat:
             _format_image(filesystem, current['size'], options['filesystem'], options['label'],
-                          contents if action == 'persistence' else None)
-        if action == 'windows':
-            if options['filesystem'] == 'ntfs':
-                capture = os.path.join(work, 'payload.wim')
-                _run(['wimlib-imagex', 'capture', contents, capture, '--no-acls', '--compress=none'])
-                _check_cancel(cancel)
-                _run(['wimlib-imagex', 'apply', capture, '1', filesystem])
-            else:
-                for entry in sorted(Path(contents).iterdir()):
-                    _check_cancel(cancel)
-                    _run(['mcopy', '-i', filesystem, '-s', str(entry), '::/'])
+                          contents if action == 'persistence' else None, cancel=cancel)
+        if action == 'windows' and not direct_fat:
+            capture = os.path.join(work, 'payload.wim')
+            _run(['wimlib-imagex', 'capture', contents, capture, '--no-acls', '--compress=none'], cancel=cancel)
+            _check_cancel(cancel)
+            _run(['wimlib-imagex', 'apply', capture, '1', filesystem], cancel=cancel)
+        ranges = [] if direct_fat else [(0, current['size'])]
+        transfer_size = sum(length for _, length in ranges)
+        if direct_fat:
+            bytes_written = transfer_size
         _check_cancel(cancel)
         again = _validate(target, options.get('allow_file', False))
         if not _same_identity(current['identity'], again):
             raise ValueError('Target identity changed during staging')
         if source:
-            _source_safe(source, target)
+            _source_safe(source, target, cancel)
             if _source_identity(source) != current['source_identity']:
                 raise ValueError('Source changed during staging')
         if options.get('unattend') and _source_identity(options['unattend']) != current['unattend_identity']:
@@ -448,6 +728,7 @@ def execute_operation(plan, *, progress=None, cancel=None, expected_identity=Non
         if expected_identity is not None:
             unmount.assert_target_identity(target, expected_identity)
         fd = os.open(target, flags)
+        destructive_started = False
         try:
             _check_cancel(cancel)
             opened = os.fstat(fd)
@@ -469,58 +750,85 @@ def execute_operation(plan, *, progress=None, cancel=None, expected_identity=Non
                 if action == 'persistence':
                     entry = f"start={current['offset']//512}, size={current['size']//512}, type=83\n"
                     _check_cancel(cancel)
-                    _run(['sfdisk', '--append', '--no-reread', '--no-tell-kernel', handle], input=entry.encode())
+                    _run(['sfdisk', '--append', '--no-reread', '--no-tell-kernel', handle], input=entry.encode(), cancel=cancel)
                 else:
                     table = 'msdos' if options['partition_table'] == 'mbr' else 'gpt'
                     _check_cancel(cancel)
-                    _run(['parted', '-s', handle, 'mklabel', table])
+                    destructive_started = True
+                    _run(['parted', '-s', handle, 'mklabel', table], cancel=cancel)
                     hint = 'fat32' if options['filesystem'] == 'fat32' else ('ntfs' if options['filesystem'] in ('ntfs', 'exfat') else 'ext2')
                     _check_cancel(cancel)
                     _run(['parted', '-s', handle, 'unit', 'B', 'mkpart', 'primary', hint,
-                          str(current['offset']), str(current['offset']+current['size']-1)])
+                          str(current['offset']), str(current['offset']+current['size']-1)], cancel=cancel)
                     if action == 'windows':
                         if current['efi_offset'] is not None:
                             _check_cancel(cancel)
                             _run(['parted', '-s', handle, 'unit', 'B', 'mkpart', 'UEFI_NTFS' if table == 'gpt' else 'primary', 'fat16',
-                                  str(current['efi_offset']), str(current['efi_offset']+MiB-1)])
+                                  str(current['efi_offset']), str(current['efi_offset']+MiB-1)], cancel=cancel)
                             _check_cancel(cancel)
-                            _run(['parted', '-s', handle, 'set', '2', 'esp', 'on'])
+                            _run(['parted', '-s', handle, 'set', '2', 'esp', 'on'], cancel=cancel)
                         else:
                             _check_cancel(cancel)
-                            _run(['parted', '-s', handle, 'set', '1', 'esp' if table == 'gpt' else 'boot', 'on'])
-                with open(filesystem, 'rb') as stream:
+                            _run(['parted', '-s', handle, 'set', '1', 'esp' if table == 'gpt' else 'boot', 'on'], cancel=cancel)
+                if direct_fat:
+                    bytes_written = layout.write(fd, lambda node: _direct_stream(source_handle, node, cancel),
+                                                 lambda: _check_cancel(cancel), progress, _sync_for_readback)
+                    if (_source_identity(source) != current['source_identity']
+                            or _source_identity(source_handle) != current['source_identity']):
+                        raise ValueError('Source changed during streaming')
+                    if options.get('unattend') and _source_identity(options['unattend']) != current['unattend_identity']:
+                        raise ValueError('Unattend changed during streaming')
+                    if not _same_identity(current['identity'], _validate(target, options.get('allow_file', False))):
+                        raise ValueError('Target identity changed during streaming')
+                for phase in (() if direct_fat else ('write', 'verify')):
+                    if progress:
+                        progress(dict(phase=phase, completed=0, total=transfer_size))
                     done = 0
-                    while True:
-                        _check_cancel(cancel)
-                        data = stream.read(4*MiB)
-                        if not data:
-                            break
-                        _pwrite_all(fd, data, current['offset']+done)
-                        done += len(data)
+                    with open(filesystem, 'rb') as stream:
+                        for start, length in ranges:
+                            stream.seek(start)
+                            for position in range(start, start + length, 4 * MiB):
+                                _check_cancel(cancel)
+                                count = min(4 * MiB, start + length - position)
+                                data = stream.read(count)
+                                if len(data) != count:
+                                    raise IOError('Truncated staged filesystem')
+                                if phase == 'write':
+                                    _pwrite_all(fd, data, current['offset'] + position)
+                                elif os.pread(fd, count, current['offset'] + position) != data:
+                                    raise IOError('Filesystem read-back verification failed')
+                                done += count
+                                if progress:
+                                    progress(dict(phase=phase, completed=done, total=transfer_size))
+                    if phase == 'write':
                         if progress:
-                            progress(dict(phase='write', completed=done, total=current['size']))
-                _sync_for_readback(fd)
-                # Read back the exact written range rather than trusting exit codes.
-                with open(filesystem, 'rb') as stream:
-                    done = 0
-                    while True:
-                        _check_cancel(cancel)
-                        data = stream.read(4*MiB)
-                        if not data:
-                            break
-                        if os.pread(fd, len(data), current['offset']+done) != data:
-                            raise IOError('Filesystem read-back verification failed')
-                        done += len(data)
+                            progress(dict(phase='sync', completed=done, total=transfer_size))
+                        _sync_for_readback(fd)
                 if current['efi_offset'] is not None:
+                    if progress:
+                        progress(dict(phase='finalizing', completed=done, total=current['size']))
                     _check_cancel(cancel)
                     efi = _uefi_ntfs_asset().read_bytes()
                     _pwrite_all(fd, efi, current['efi_offset'])
+                    if progress:
+                        progress(dict(phase='sync', completed=done, total=current['size']))
                     _sync_for_readback(fd)
                     if os.pread(fd, len(efi), current['efi_offset']) != efi:
                         raise IOError('UEFI:NTFS read-back verification failed')
+            if progress:
+                progress(dict(phase='sync', completed=current['size'], total=current['size']))
             os.fsync(fd)
+            _check_cancel(cancel)
+        except Exception as exc:
+            if direct_fat and destructive_started and not isinstance(exc, OperationCancelled):
+                # Preserve useful exception types without ever reporting partial media as success.
+                message = str(exc) + '; target contains incomplete installation media'
+                if isinstance(exc, OSError):
+                    raise OSError(message) from exc
+                exc.args = (message,)
+            raise
         finally:
             os.close(fd)
-    return dict(status='completed', action=action, target=target, bytes_written=current['size'],
+    return dict(status='completed', action=action, target=target, bytes_written=bytes_written,
                 verified=True, warning='Bad-block tests cannot certify hardware authenticity or long-term reliability.'
                 if action == 'badblocks' else 'Bootability depends on supplied firmware and image; not boot-tested.')

@@ -2,6 +2,12 @@
 
 Workflow: `.github/workflows/release.yml` (Ubuntu 24.04).
 
+Ubuntu 24.04 lacks the PySide6 Debian packages. CI uses a temporary virtual
+environment with pinned PySide6 6.8.3 and system Tk for tests, including extracted
+package tests. This is not an installation test of the Debian package on 24.04;
+installing the package requires a distribution providing its declared PySide6
+dependencies. The verifier uses the Python interpreter that invokes it.
+
 - Push to `master`, pull requests to `master`, and manual **Run workflow**:
   run tests, build the architecture-independent Debian package and source archive,
   test extracted package modules, and verify a byte-identical rebuild from the
@@ -16,8 +22,8 @@ Workflow: `.github/workflows/release.yml` (Ubuntu 24.04).
 After committing and pushing the desired version:
 
 ```sh
-git tag -a v0.3.0 -m 'Lifus 0.3.0'
-git push origin v0.3.0
+git tag -a v0.4.0 -m 'Lifus 0.4.0'
+git push origin v0.4.0
 ```
 
 Before pushing a release tag, review `COPYING.md` and provide corresponding upstream
@@ -40,9 +46,9 @@ Local equivalent:
 ```sh
 export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
 /usr/bin/python3 -m unittest discover -s tests -v
-/usr/bin/python3 build-deb.py --version 0.3.0
-/usr/bin/python3 build-source.py --version 0.3.0
-/usr/bin/python3 packaging/verify-release.py --version 0.3.0
+/usr/bin/python3 build-deb.py --version 0.4.0
+/usr/bin/python3 build-source.py --version 0.4.0
+/usr/bin/python3 packaging/verify-release.py --version 0.4.0
 ```
 
 Build from a clean checkout. GitHub Actions checks out a clean tree. The source

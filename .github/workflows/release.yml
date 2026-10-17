@@ -46,11 +46,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            python3 python3-tk dpkg-dev sudo util-linux fdisk parted \
+            python3 python3-tk python3-venv dpkg-dev sudo util-linux fdisk parted \
             dosfstools e2fsprogs exfatprogs ntfs-3g mtools p7zip-full wimtools \
             xorriso xvfb xauth
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/lifus-venv"
+          "$RUNNER_TEMP/lifus-venv/bin/python" -m pip install 'PySide6==6.8.3'
       - name: Test
-        run: xvfb-run -a /usr/bin/python3 -m unittest discover -s tests -v
+        run: xvfb-run -a "$RUNNER_TEMP/lifus-venv/bin/python" -m unittest discover -s tests -v
       - name: Build and verify release files
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -58,7 +60,7 @@ jobs:
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           /usr/bin/python3 build-deb.py --version "$VERSION"
           /usr/bin/python3 build-source.py --version "$VERSION"
-          xvfb-run -a /usr/bin/python3 packaging/verify-release.py --version "$VERSION"
+          xvfb-run -a "$RUNNER_TEMP/lifus-venv/bin/python" packaging/verify-release.py --version "$VERSION"
       - name: Upload verified artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (Node.js 24)
         with:

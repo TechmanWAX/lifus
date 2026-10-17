@@ -13,7 +13,7 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', type=Path, default=Path(__file__).resolve().parent / 'dist')
-    parser.add_argument('--version', default='0.3.0')
+    parser.add_argument('--version', default='0.4.0')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9][A-Za-z0-9.+~]*', args.version):
         parser.error('Version must be a Debian upstream version without a revision')
@@ -44,7 +44,7 @@ def main():
         copy(base / 'README.md', 'usr/share/doc/lifus/README.md')
         copy(base / 'docs/FEATURES.md', 'usr/share/doc/lifus/FEATURES.md')
         copy(base / 'docs/SOURCE.md', 'usr/share/doc/lifus/SOURCE.md')
-        for name in ('WINDOWS_CONFIG.md', 'CONTAINERS.md', 'VALIDATION.md', 'UNMOUNT.md'):
+        for name in ('WINDOWS_CONFIG.md', 'WINDOWS_STAGING.md', 'CONTAINERS.md', 'VALIDATION.md', 'UNMOUNT.md'):
             copy(base / 'docs' / name, 'usr/share/doc/lifus/' + name)
         upstream = base / 'upstream'
         for path in sorted(upstream.rglob('*')):
@@ -58,9 +58,9 @@ Section: utils
 Priority: optional
 Architecture: all
 Maintainer: Lifus contributors <lifus@localhost>
-Depends: python3 (>= 3.10), python3-tk, sudo, util-linux, fdisk, parted, dosfstools, e2fsprogs, exfatprogs, ntfs-3g, mtools, p7zip-full, wimtools
+Depends: python3 (>= 3.10), python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, python3-tk, sudo, util-linux, fdisk, parted, dosfstools, e2fsprogs, exfatprogs, ntfs-3g, mtools, p7zip-full, wimtools
 Description: Unofficial native Linux Rufus-inspired USB utility
- Native Tk and CLI application for image writing, verification, backup,
+ Native PySide6/Qt and CLI application for image writing, verification, backup,
  FreeDOS image creation and guarded advanced disk operations.
  This is not an official Rufus release or a full feature-parity port.
 ''', encoding='utf-8')

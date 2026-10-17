@@ -212,7 +212,7 @@ def worker_main(argv=None):
         print(json.dumps({'type': kind, 'data': data}, default=str), flush=True)
 
     def progress(done, total=None):
-        if isinstance(done, dict):
+        if isinstance(done, dict) and 'phase' not in done:
             done, total = done.get('completed', 0), done.get('total', 0)
         emit('progress', [done, total])
 

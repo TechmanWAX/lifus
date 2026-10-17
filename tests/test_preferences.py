@@ -66,19 +66,19 @@ class PreferenceTests(unittest.TestCase):
         from unittest.mock import Mock
         from lifus import gui
         prefs = self.module()
-        app = SimpleNamespace(source=Mock())
+        app = SimpleNamespace(source=Mock(), root=None)
         for selection in ('', str(self.home/'selected.iso')):
             with patch.object(prefs, 'get_last_image_directory', return_value=str(self.home)) as getdir, \
                     patch.object(prefs, 'remember_image_directory') as remember, \
-                    patch.object(gui.filedialog, 'askopenfilename', return_value=selection) as choose:
+                    patch.object(gui.QFileDialog, 'getOpenFileName', return_value=(selection, '')) as choose:
                 gui.Application.browse_source(app)
-                self.assertEqual(choose.call_args.kwargs.get('initialdir'), str(self.home))
+                self.assertEqual(choose.call_args.args[2], str(self.home))
                 if selection:
                     remember.assert_called_once_with(selection)
-                    app.source.set.assert_called_once_with(selection)
+                    app.source.setText.assert_called_once_with(selection)
                 else:
                     remember.assert_not_called()
-                    app.source.set.assert_not_called()
+                    app.source.setText.assert_not_called()
 
     def test_relative_xdg_ignored_and_other_settings_preserved(self):
         prefs = self.module()

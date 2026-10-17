@@ -61,7 +61,9 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(result['verified'])
         self.assertEqual(result['bytes_written'], len(data))
         self.assertEqual(target.read_bytes(), data + b'X' * 32)
-        self.assertEqual(events[-1], (len(data), len(data)))
+        self.assertEqual([event for event in events if isinstance(event[0], int)][-1],
+                         (len(data), len(data)))
+        self.assertEqual(events[-1][0]['phase'], 'verify')
         with self.assertRaises(ValueError):
             writer.write_image(source, target)
         with self.assertRaises(ValueError):
@@ -91,7 +93,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result['bytes_written'], len(data))
         self.assertEqual(destination.read_bytes(), data)
         self.assertEqual(source.read_bytes(), data)
-        self.assertEqual(events[-1], (len(data), len(data)))
+        self.assertEqual([event for event in events if isinstance(event[0], int)][-1],
+                         (len(data), len(data)))
+        self.assertEqual(events[-1][0]['phase'], 'sync')
         with self.assertRaises(FileExistsError):
             writer.backup_image(source, destination)
         event = threading.Event()

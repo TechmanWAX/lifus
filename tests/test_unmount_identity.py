@@ -93,7 +93,7 @@ class UnmountIdentityTests(unittest.TestCase):
         replace(writer.fcntl, 'ioctl', lambda *a: struct.pack('Q', 4096))
         replace(operations, '_validate', validate)
         replace(operations, '_source_safe', lambda *a: None)
-        replace(operations, '_format_image', lambda path, *a: Path(path).write_bytes(b''))
+        replace(operations, '_format_image', lambda path, *a, **kw: Path(path).write_bytes(b''))
         replace(operations, '_run', lambda args, **kw: commands.append(args))
         replace(operations, '_pwrite_all', lambda *a: writes.append(a))
         preview = dict(action='format', source=None, target=str(target), identity=info,

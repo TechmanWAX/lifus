@@ -97,11 +97,11 @@ class CLITests(unittest.TestCase):
             load.return_value.create_image.assert_called_once_with('dos.img', size_mib=64, label='FREEDOS')
 
     def test_native_gui_controls(self):
-        import tkinter as tk
-        try:
-            root = tk.Tk()
-        except tk.TclError:
-            self.skipTest('No graphical display')
+        import os
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PySide6.QtWidgets import QApplication, QWidget
+        qt = QApplication.instance() or QApplication([])
+        root = QWidget()
         try:
             try:
                 gui = importlib.import_module('lifus.gui')
@@ -109,15 +109,15 @@ class CLITests(unittest.TestCase):
                 self.fail('GUI not implemented: ' + str(exc))
             with patch.object(gui, 'list_devices', return_value=[]):
                 app = gui.Application(root)
-                root.update()
-                self.assertIn('write', app.action_box['values'])
-                self.assertIn('freedos', app.action_box['values'])
-                self.assertEqual(app.start_button['text'], 'Start')
+                qt.processEvents()
+                self.assertGreaterEqual(app.action_box.findData('write'), 0)
+                self.assertGreaterEqual(app.action_box.findData('freedos'), 0)
+                self.assertEqual(app.start_button.text(), 'СТАРТ')
                 self.assertFalse(app.cancel_event.is_set())
                 app.cancel()
                 self.assertTrue(app.cancel_event.is_set())
         finally:
-            root.destroy()
+            root.close()
 
     def test_debian_build_contains_launcher_and_assets(self):
         import pathlib
@@ -130,6 +130,9 @@ class CLITests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             packages = list(pathlib.Path(temp).glob('*.deb'))
             self.assertEqual(len(packages), 1)
+            depends = subprocess.check_output(['dpkg-deb', '-f', str(packages[0]), 'Depends'], text=True)
+            for dependency in ('python3-pyside6.qtwidgets', 'python3-pyside6.qtcore', 'python3-pyside6.qtgui', 'python3-tk'):
+                self.assertIn(dependency, depends)
             contents = subprocess.check_output(['dpkg-deb', '--contents', str(packages[0])], text=True)
             for name in ('usr/bin/lifus', 'usr/share/lifus/lifus-privileged.py', 'usr/libexec/lifus-askpass', 'usr/share/lifus/lifus/cli.py', 'usr/share/applications/lifus.desktop', 'usr/share/lifus/upstream/res/freedos/', 'mbr_win7.h', 'usr/share/doc/lifus/copyright'):
                 self.assertIn(name, contents)

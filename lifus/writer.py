@@ -20,6 +20,9 @@ from . import devices, unmount
 from .images import CHUNK_SIZE
 
 
+_SYNC_INTERVAL = 16 * 1024 * 1024
+
+
 class CancelledError(InterruptedError):
     """Operation cancelled; a destination may already be partially written."""
 
@@ -27,6 +30,11 @@ class CancelledError(InterruptedError):
 def _cancelled(cancel):
     if cancel is not None and cancel.is_set():
         raise CancelledError('Operation cancelled')
+
+
+def _phase(progress, phase, completed=0, total=0):
+    if progress:
+        progress(dict(phase=phase, completed=completed, total=total), None)
 
 
 def _identity(st):
@@ -110,6 +118,7 @@ def backup_image(source, destination, *, progress=None, cancel=None):
     Partial files are removed on failure when still owned by this operation.
     """
     _cancelled(cancel)
+    _phase(progress, 'prepare')
     destination = os.path.abspath(os.fspath(destination))
     if os.path.realpath(destination) != destination:
         raise ValueError('Symlink destination paths are not allowed')
@@ -122,6 +131,7 @@ def backup_image(source, destination, *, progress=None, cancel=None):
         try:
             done = 0
             digest = hashlib.sha256()
+            _phase(progress, 'write', 0, total)
             if progress:
                 progress(0, total)
             while done < total:
@@ -135,6 +145,7 @@ def backup_image(source, destination, *, progress=None, cancel=None):
                 if progress:
                     progress(done, total)
             _cancelled(cancel)
+            _phase(progress, 'sync', done, total)
             os.fsync(fd)
             os.fsync(parent_fd)
             try:
@@ -165,12 +176,14 @@ def write_image(source, target, *, allow_file=False, verify=True,
                 progress=None, cancel=None, expected_identity=None):
     """Write decoded bytes; regular destination files require explicit opt-in.
 
-    Progress reports write-phase bytes only. Readback verifies precisely the
+    Numeric progress reports write-phase bytes only; phase dictionaries are
+    passed with None as the second callback argument. Readback verifies precisely the
     image range; a larger target's tail is intentionally preserved.
     expected_identity, when supplied, is the original plan_unmount identity;
     it supplements (never replaces) strict safety validation at every phase.
     """
     _cancelled(cancel)
+    _phase(progress, 'prepare')
     info = devices.validate_target(target, allow_file=allow_file)
     if expected_identity is not None:
         unmount.assert_target_identity(target, expected_identity)
@@ -199,7 +212,8 @@ def write_image(source, target, *, allow_file=False, verify=True,
         if expected_identity is not None:
             unmount.assert_target_identity(target, expected_identity)
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
-        if stat.S_ISBLK(before.st_mode):
+        block_target = stat.S_ISBLK(before.st_mode)
+        if block_target:
             flags |= os.O_EXCL  # Linux refuses an in-use block device.
         fd = os.open(target, flags)
         try:
@@ -215,21 +229,34 @@ def write_image(source, target, *, allow_file=False, verify=True,
                 raise ValueError('Target shrank during preflight')
             snapshot.seek(0)
             done = 0
+            pending = 0
+            _phase(progress, 'write', 0, size)
             if progress:
                 progress(0, size)
             if expected_identity is not None:
                 unmount.assert_target_identity(target, expected_identity, fd=fd)
             while True:
                 _cancelled(cancel)
-                block = snapshot.read(CHUNK_SIZE)
+                block = snapshot.read(min(CHUNK_SIZE, _SYNC_INTERVAL - pending)
+                                      if block_target else CHUNK_SIZE)
                 if not block:
                     break
                 _write_all(fd, block)
                 done += len(block)
+                pending += len(block)
                 if progress:
                     progress(done, size)
+                if block_target and pending >= _SYNC_INTERVAL and done < size:
+                    # Bound dirty kernel cache rather than reporting an entire
+                    # device's buffered writes before the first durability wait.
+                    _phase(progress, 'flush', done, size)
+                    os.fsync(fd)
+                    pending = 0
+                    _phase(progress, 'write', done, size)
+            _phase(progress, 'sync', done, size)
             os.fsync(fd)
             if verify:
+                _phase(progress, 'verify', 0, size)
                 # Flush first, then ask the kernel to evict clean cached pages.
                 # Length zero covers the final partial page as well. This is
                 # advisory: kernels may retain pages and device/controller caches
@@ -246,6 +273,7 @@ def write_image(source, target, *, allow_file=False, verify=True,
                         raise OSError('Unexpected EOF during readback')
                     actual.update(block)
                     remaining -= len(block)
+                    _phase(progress, 'verify', size - remaining, size)
                 if actual.digest() != digest.digest():
                     raise OSError('Readback verification failed')
             _cancelled(cancel)

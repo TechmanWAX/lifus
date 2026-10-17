@@ -1,6 +1,6 @@
 # Lifus — native Linux USB media utility
 
-Unofficial Rufus-inspired application for Linux, using Python 3 and Tk (no Wine).
+Unofficial Rufus-inspired application for Linux, using Python 3 and PySide6/Qt Widgets (no Wine). The isolated sudo askpass helper still uses Tk.
 This checkout contains only the Linux host application and its required boot
 resources. It can prepare **Windows installer USB media on Linux**; removing the
 Windows host build does not remove Windows ISO support. It is not an official

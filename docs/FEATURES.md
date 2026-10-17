@@ -22,8 +22,8 @@ USB devices. No physical target disks were written during development.
 | Bad blocks and fake-flash checks | Destructive full-device address-dependent pseudorandom write/read comparison, 1–4 passes; detects mismatches/wrapped capacity, stops on first error. Never restores original data. File-image tested, no counterfeit-hardware test or reliability certification. |
 | Download official Windows 8/10/11 retail ISOs | Not implemented. No Fido/Microsoft downloader integration. |
 | Download UEFI Shell ISOs | Not implemented. User-supplied images only. |
-| Modern familiar UI, 38 languages | Native Tk interface and CLI; no claim of Rufus visual equivalence or 38-language translation coverage. |
-| Small footprint, no installation | Python standard-library application plus external Linux tools. Source execution and Debian packaging; not a standalone dependency-free Windows executable. |
+| Modern familiar UI, 38 languages | Native PySide6/Qt interface with compact Rufus-style sections and Russian labels, plus CLI; no claim of pixel-identical reproduction or 38-language translation coverage. |
+| Small footprint, no installation | Python application with PySide6/Qt GUI plus external Linux tools. Source execution and Debian packaging; not a standalone dependency-free Windows executable. |
 | Portable, Secure Boot compatible | Linux-specific dependencies and privilege model. No installed firmware/boot security bypass; image boot compatibility is inherited, not guaranteed. |
 | Free software, GPL v3 | Repository remains GPL-licensed; reused upstream assets retain their notices and licenses. |
 
@@ -67,18 +67,25 @@ chunks/stages, not inside every external mkfs/parted/wimlib invocation.
 
 ### Windows UEFI path
 
-Requires `parted`, `mkfs.vfat`, `7z`, **mtools (`mcopy`)**, and `wimlib-imagex`.
-The development host lacked mtools; integration used a locally unpacked package,
-without installing it system-wide. Production must install this dependency.
-No Windows/EFI executable is synthesized. ISO must contain a supported removable
-EFI loader (`bootx64.efi`, `bootaa64.efi`, or `bootia32.efi`) and `sources/boot.wim`.
-Files are extracted individually through 7z stdout to exclusive ordinary files;
-archive paths cannot control root extraction destinations. Absolute paths,
-traversal, links reported by the archive, duplicate case-folded paths, and
-oversize non-WIM files are refused. No ISO kernel mounts or loop devices are used.
-An `install.wim` larger than FAT32's 4 GiB minus one byte limit is split using
-wimlib into 3800 MiB `.swm` pieces. That large-WIM branch exists but has not been
-validated against a >4 GiB production Windows ISO. Windows boot is not tested.
+Requires `parted` and `7z`; `wimlib-imagex` is needed only for oversized WIM
+splitting. The direct FAT32 formatter uses bounded writes through the pinned
+exclusive target descriptor; mtools is an independent test reader, not the
+production writer for this path. No Windows/EFI executable is synthesized.
+ISO must contain a supported removable EFI loader (`bootx64.efi`, `bootaa64.efi`,
+or `bootia32.efi`) and `sources/boot.wim`. Ordinary files stream from the pinned
+ISO straight into final target clusters; **no partition image or extracted
+payload staging** is used. The detected UDF/ISO parser and entire namespace are
+checked before destruction. Absolute paths, traversal, links, invalid FAT names,
+case collisions, file/directory conflicts and oversized non-WIM files are refused.
+No ISO kernel mounts or loop devices are used. Metadata and every file's SHA-256
+are read back after fsync. Errors/cancellation leave explicitly incomplete media.
+An `install.wim` larger than FAT32's 4 GiB minus one byte limit is extracted and
+split before destruction using wimlib into 3800 MiB `.swm` pieces. That exceptional
+path estimates twice the WIM size plus 64 MiB; ordinary FAT32 reports 0 temporary
+payload bytes. The split path is tested with real small WIMs at reduced test
+thresholds, not with a production >4 GiB WIM. A real Windows10Pro_22H2.iso with
+`install.esd` passed independent hash checks for all 908 files on a private file
+target; Windows boot is not tested. See [WINDOWS_STAGING.md](WINDOWS_STAGING.md).
 
 ### Windows NTFS path
 
@@ -120,11 +127,12 @@ and reading back persistence.conf; no real Debian persistence boot was tested.
   overwrites **every byte**, including all partition tables and filesystem data.
   Persistence changes the partition table and unused tail; interruption can still
   damage media. No action provides rollback.
-* Filesystems and Windows payloads are staged before the target partition table
-  is changed. Staging can require several times the ISO size plus partition size.
-* Exclusive block-device opens, no-follow opens, private staging, argv-only
-  subprocesses, bounded chunk copying, fsync, and byte-for-byte filesystem
-  readback provide defense in depth. Hostile physical device replacement and
+* Windows FAT32 writes directly after preflight; only oversized WIM splitting is
+  staged before destruction. NTFS, generic formatting and persistence still stage
+  filesystems, and NTFS can require several times the ISO size plus partition size.
+* Exclusive block-device opens, no-follow opens, private exceptional staging,
+  argv-only subprocesses, bounded chunk copying, fsync, metadata readback and
+  streamed-file SHA-256 comparisons provide defense in depth. Hostile physical device replacement and
   other privileged writers cannot be ruled out by application software.
 * No mounts or loops are acquired, so failures/cancellation cannot leak them.
   Staging and descriptors are closed through context managers/finally blocks.
